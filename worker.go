@@ -37,7 +37,7 @@ func (w *DefaultWorker) Close() {
 	close(w.jobChan) // 关闭工作协程通道
 }
 
-func NewDefaultWorker(pool *Pool) *DefaultWorker {
+func newDefaultWorker(pool *Pool) Worker {
 	worker := &DefaultWorker{
 		jobChan: make(chan Job, 1), // 初始化工作协程通道
 		pool:    pool,

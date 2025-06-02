@@ -6,13 +6,14 @@ import (
 )
 
 type Pool struct {
-	minGoroutine int64       // 常驻的协程数量
-	capacity     int64       // 最大协程数量
-	workerChan   chan Worker // 工作协程通道
-	jobChan      chan Job    // 任务通道, 默认缓冲区大小为100
-	curGoroutine int64       // 当前协程数量
-	expireTime   int32       // 关闭的超时时间，单位为秒,默认3秒,如果小于等于0则不超时
-	state        int32       // 池的状态
+	minGoroutine     int64              // 常驻的协程数量
+	capacity         int64              // 最大协程数量
+	workerChan       chan Worker        // 工作协程通道
+	jobChan          chan Job           // 任务通道, 默认缓冲区大小为100
+	curGoroutine     int64              // 当前协程数量
+	expireTime       int32              // 关闭的超时时间，单位为秒,默认3秒,如果小于等于0则不超时
+	state            int32              // 池的状态
+	createWorkerFunc func(*Pool) Worker // 创建工作协程的函数
 }
 
 type PoolOption func(*Pool)
@@ -33,21 +34,28 @@ func WithJobChanCapacity(length int) PoolOption {
 	}
 }
 
+func WithCreateWorkerFunc(createWorkerFunc func(*Pool) Worker) PoolOption {
+	return func(p *Pool) {
+		p.createWorkerFunc = createWorkerFunc // 设置自定义创建工作协程的函数
+	}
+}
+
 func NewPool(minGoroutine, capacity int64, options ...PoolOption) *Pool {
 	pool := &Pool{
-		minGoroutine: minGoroutine,
-		capacity:     capacity,
-		workerChan:   make(chan Worker, capacity),
-		jobChan:      make(chan Job, 100), // 任务通道，缓冲区大小为100
-		expireTime:   3,
-		state:        Running,
+		minGoroutine:     minGoroutine,
+		capacity:         capacity,
+		workerChan:       make(chan Worker, capacity),
+		jobChan:          make(chan Job, 100), // 任务通道，缓冲区大小为100
+		expireTime:       3,
+		state:            Running,
+		createWorkerFunc: newDefaultWorker,
 	}
 	// 应用配置选项
 	for _, option := range options {
 		option(pool)
 	}
 	for i := int64(0); i < minGoroutine; i++ {
-		worker := NewDefaultWorker(pool)
+		worker := pool.createWorkerFunc(pool)
 		pool.workerChan <- worker // 将工作协程放入工作协程通道
 	}
 	pool.curGoroutine = minGoroutine // 初始化当前协程数量
@@ -74,7 +82,7 @@ func (p *Pool) run() {
 		default:
 			if atomic.LoadInt64(&p.curGoroutine) < p.capacity {
 				atomic.AddInt64(&p.curGoroutine, 1)
-				worker := NewDefaultWorker(p)
+				worker := newDefaultWorker(p)
 				worker.Send(job)
 			} else {
 				// 阻塞直到有 worker 可用
