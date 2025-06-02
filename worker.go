@@ -1,7 +1,6 @@
 package go_pool
 
 type Worker interface {
-	Run()
 	Send(job Job)
 	Close()
 }
@@ -27,7 +26,7 @@ func (w *DefaultWorker) Run() {
 			if job != nil {
 				job()
 			}
-			w.pool.WorkerChan <- w // 将工作协程放回池中
+			w.pool.workerChan <- w // 将工作协程放回池中
 			//case <-ticker.C: // 长时间不使用回收部分协程
 			//	w.Close()
 		}
