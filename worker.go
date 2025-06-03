@@ -1,6 +1,11 @@
 package go_pool
 
-import "time"
+import (
+	"log"
+	"os"
+	"runtime/debug"
+	"time"
+)
 
 type Worker interface {
 	Send(job Job)
@@ -12,6 +17,7 @@ type DefaultWorker struct {
 	jobChan    chan Job // 工作协程通道
 	pool       *Pool
 	activeTime time.Time // 活跃时间
+	logger     *log.Logger
 }
 
 func (w *DefaultWorker) ActiveTime() time.Time {
@@ -24,8 +30,14 @@ func (w *DefaultWorker) Send(job Job) {
 	w.jobChan <- job // 将任务发送到工作协程
 }
 
-func (w *DefaultWorker) Run() {
-	//ticker := time.NewTicker(5 * time.Second)
+func (w *DefaultWorker) run() {
+	defer func() {
+		if p := recover(); p != nil {
+			// 捕获异常，防止工作协程崩溃
+			w.logger.Println("worker exits from panic: %v\n%s\n", p, debug.Stack())
+			go w.run() // 重新启动工作协程
+		}
+	}()
 	for {
 		select {
 		case job, ok := <-w.jobChan:
@@ -50,7 +62,8 @@ func newDefaultWorker(pool *Pool) Worker {
 		jobChan:    make(chan Job, 1), // 初始化工作协程通道
 		pool:       pool,
 		activeTime: time.Now(),
+		logger:     log.New(os.Stderr, "[worker] ", log.LstdFlags),
 	}
-	go worker.Run()
+	go worker.run()
 	return worker
 }
