@@ -46,7 +46,7 @@ func TestGoPool(t *testing.T) {
 }
 
 func TestGoPoolClose(t *testing.T) {
-	pool := NewPool(3, 20, WithExpireTime(1))
+	pool := NewPool(3, 20, WithCloseExpireTime(1))
 	for i := 0; i < 1000; i++ {
 		val := i
 		job := func() {

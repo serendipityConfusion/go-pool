@@ -9,34 +9,48 @@ type Pool struct {
 	minGoroutine     int64              // 常驻的协程数量
 	capacity         int64              // 最大协程数量
 	workerChan       chan Worker        // 工作协程通道
-	jobChan          chan Job           // 任务通道, 默认缓冲区大小为100
 	curGoroutine     int64              // 当前协程数量
-	expireTime       int32              // 关闭的超时时间，单位为秒,默认3秒,如果小于等于0则不超时
+	closeExpireTime  time.Duration      // 关闭的超时时间，单位为秒,默认3秒,如果小于等于0则不超时
 	state            int32              // 池的状态
 	createWorkerFunc func(*Pool) Worker // 创建工作协程的函数
+	idleTimeout      time.Duration      // 空闲协程的超时时间,默认3秒
+	releaseCount     int                // 单次检测协程数量
+	reclaimerTime    time.Duration      // 回收协程的超时时间，默认10秒
 }
 
 type PoolOption func(*Pool)
 
-func WithExpireTime(expireTime int32) PoolOption {
+// WithCloseExpireTime 设置关闭池的超时时间
+func WithCloseExpireTime(expireTime time.Duration) PoolOption {
 	return func(p *Pool) {
-		p.expireTime = expireTime
+		p.closeExpireTime = expireTime
 	}
 }
 
-func WithJobChanCapacity(length int) PoolOption {
-	return func(p *Pool) {
-		if length < 0 {
-			p.jobChan = make(chan Job, 100) // 默认缓冲区大小为100
-			return
-		}
-		p.jobChan = make(chan Job, length) // 设置任务通道的缓冲区大小
-	}
-}
-
+// WithCreateWorkerFunc 设置创建工作协程的函数
 func WithCreateWorkerFunc(createWorkerFunc func(*Pool) Worker) PoolOption {
 	return func(p *Pool) {
 		p.createWorkerFunc = createWorkerFunc // 设置自定义创建工作协程的函数
+	}
+}
+
+// WithIdleTimeout 设置空闲协程超时时间
+func WithIdleTimeout(idleTimeout time.Duration) PoolOption {
+	return func(p *Pool) {
+		p.idleTimeout = idleTimeout
+	}
+}
+
+// WithReclaimerTime 设置回收协程的超时时间
+func WithReclaimerTime(reclaimerTime time.Duration) PoolOption {
+	return func(p *Pool) {
+		p.reclaimerTime = reclaimerTime
+	}
+}
+
+func WithReleaseContinueCount(releaseCount int) PoolOption {
+	return func(p *Pool) {
+		p.releaseCount = releaseCount
 	}
 }
 
@@ -45,10 +59,12 @@ func NewPool(minGoroutine, capacity int64, options ...PoolOption) *Pool {
 		minGoroutine:     minGoroutine,
 		capacity:         capacity,
 		workerChan:       make(chan Worker, capacity),
-		jobChan:          make(chan Job, 100), // 任务通道，缓冲区大小为100
-		expireTime:       3,
+		closeExpireTime:  3,
 		state:            Running,
 		createWorkerFunc: newDefaultWorker,
+		idleTimeout:      3 * time.Second,  // 默认空闲协程超时时间为3秒
+		reclaimerTime:    10 * time.Second, // 默认回收协程的超时时间为10秒
+		releaseCount:     int(capacity-minGoroutine) / 3,
 	}
 	// 应用配置选项
 	for _, option := range options {
@@ -59,42 +75,38 @@ func NewPool(minGoroutine, capacity int64, options ...PoolOption) *Pool {
 		pool.workerChan <- worker // 将工作协程放入工作协程通道
 	}
 	pool.curGoroutine = minGoroutine // 初始化当前协程数量
-	go pool.run()
+	go pool.reclaimer()
 	return pool
 }
 
 func (p *Pool) Do(job Job) error {
-	if atomic.LoadInt32(&p.state) == Closed {
+	if p.IsClosed() {
 		return ErrPoolClosed // 如果池已关闭，返回错误
 	}
-	p.jobChan <- job // 将任务放入任务通道
+	if job == nil {
+		return ErrJobNil
+	}
+	select {
+	case worker := <-p.workerChan:
+		worker.Send(job)
+	default:
+		if atomic.LoadInt64(&p.curGoroutine) < p.capacity {
+			atomic.AddInt64(&p.curGoroutine, 1)
+			worker := newDefaultWorker(p)
+			worker.Send(job)
+		} else {
+			// 阻塞直到有 worker 可用
+			worker := <-p.workerChan
+			worker.Send(job)
+		}
+	}
 	return nil
 }
 
-func (p *Pool) run() {
-	for job := range p.jobChan {
-		if job == nil {
-			continue
-		}
-		select {
-		case worker := <-p.workerChan:
-			worker.Send(job)
-		default:
-			if atomic.LoadInt64(&p.curGoroutine) < p.capacity {
-				atomic.AddInt64(&p.curGoroutine, 1)
-				worker := newDefaultWorker(p)
-				worker.Send(job)
-			} else {
-				// 阻塞直到有 worker 可用
-				worker := <-p.workerChan
-				worker.Send(job)
-			}
-		}
-	}
-}
-
 func (p *Pool) Close() {
-	atomic.CompareAndSwapInt32(&p.state, Running, Closed) // 设置池的状态为 Closed
+	if !atomic.CompareAndSwapInt32(&p.state, Running, Closed) { // 设置池的状态为 Closed
+		return
+	}
 	//close(p.jobChan) // 不关闭，避免panic的问题，设计上可以容忍
 	finishClose := make(chan struct{})
 	go func() {
@@ -106,7 +118,7 @@ func (p *Pool) Close() {
 		close(finishClose)
 	}()
 	// 无超时时间
-	if 0 >= p.expireTime {
+	if 0 >= p.closeExpireTime {
 		<-finishClose // 等待所有工作协程完成
 		close(p.workerChan)
 		return
@@ -114,8 +126,47 @@ func (p *Pool) Close() {
 	select {
 	case <-finishClose:
 		close(p.workerChan) // 关闭工作协程通道
-	case <-time.After(time.Duration(p.expireTime) * time.Second):
+	case <-time.After(p.closeExpireTime):
 		// 超时后强制关闭
 		return
+	}
+}
+
+func (p *Pool) IsClosed() bool {
+	return atomic.LoadInt32(&p.state) == Closed
+}
+
+// 回收长时间空闲的worker
+func (p *Pool) reclaimer() {
+	// 不回收
+	if p.reclaimerTime <= 0 || p.releaseCount <= 0 {
+		return
+	}
+	ticker := time.NewTicker(p.reclaimerTime)
+	defer ticker.Stop()
+	for {
+		<-ticker.C
+		if p.IsClosed() {
+			return
+		}
+		if len(p.workerChan) == 0 {
+			continue
+		}
+	Next:
+		count := 0
+		for i := 0; i < min(p.releaseCount, len(p.workerChan)); i++ {
+			worker := <-p.workerChan
+			if p.curGoroutine > p.minGoroutine && time.Now().Sub(worker.ActiveTime()) > p.idleTimeout {
+				worker.Close()
+				atomic.AddInt64(&p.curGoroutine, -1)
+				count++
+				continue
+			}
+			p.workerChan <- worker
+		}
+		if count > p.releaseCount/2 {
+			goto Next
+		}
+		ticker.Reset(p.reclaimerTime)
 	}
 }
