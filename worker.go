@@ -49,7 +49,7 @@ func newDefaultWorker(pool *Pool) Worker {
 	worker := &DefaultWorker{
 		jobChan:    make(chan Job, 1), // 初始化工作协程通道
 		pool:       pool,
-		activeTime: time.Now().Unix(),
+		activeTime: time.Now(),
 	}
 	go worker.Run()
 	return worker
